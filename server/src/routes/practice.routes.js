@@ -1,0 +1,433 @@
+const express = require("express");
+const pool = require("../db/pool");
+const { requireAuth } = require("../middleware/auth");
+const {
+  uploadPracticeImage,
+  processPracticeImageUpload,
+} = require("../middleware/uploadPracticeImage");
+
+const router = express.Router();
+
+/**
+ * POST /api/practices
+ * Creates a new practice.
+ * Protected: user must be logged in.
+ */
+router.post(
+  "/",
+  requireAuth,
+  uploadPracticeImage.single("image"),
+  processPracticeImageUpload,
+  async (req, res) => {
+    try {
+      const {
+        title,
+        description,
+        steps,
+        overview,
+        materials,
+        season,
+        location,
+        cropTypeId,
+        problemTypeId,
+      } = req.body;
+
+      if (!title || !description || !steps) {
+        return res
+          .status(400)
+          .json({ message: "title, description, and steps are required" });
+      }
+
+      const userId = req.user.userId;
+      const imageUrl = req.file ? req.file.path : null;
+
+      const [result] = await pool.query(
+        `INSERT INTO practices 
+         (userId, title, description, steps, overview, materials, season, location, imageUrl, cropTypeId, problemTypeId)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          userId,
+          title,
+          description,
+          steps,
+          overview || null,
+          materials || null,
+          season || null,
+          location || null,
+          imageUrl || null,
+          cropTypeId || null,
+          problemTypeId || null,
+        ]
+      );
+
+      return res.status(201).json({
+        message: "Practice created",
+        practiceId: result.insertId,
+        imageUrl,
+      });
+    } catch (err) {
+      return res.status(500).json({ message: "Server error", error: err.message });
+    }
+  },
+);
+
+/**
+ * GET /api/practices
+ * Public: lists practices.
+ * Supports a simple search with ?q=
+ * ✅ IMPORTANT: only ACTIVE practices should be visible publicly
+ */
+router.get("/", async (req, res) => {
+  try {
+    const q = req.query.q ? `%${req.query.q}%` : null;
+
+    let sql = `
+      SELECT
+        p.practiceId,
+        p.title,
+        p.description,
+        p.steps,
+        p.overview,
+        p.materials,
+        p.season,
+        p.location,
+        p.imageUrl,
+        p.effectivenessScore,
+        p.confidenceLevel,
+        p.createdAt,
+        u.fullName AS authorName
+      FROM practices p
+      JOIN users u ON u.userId = p.userId
+      WHERE p.status = 'ACTIVE'
+    `;
+
+    const params = [];
+
+    if (q) {
+      sql += ` AND (p.title LIKE ? OR p.description LIKE ?)`;
+      params.push(q, q);
+    }
+
+    sql += ` ORDER BY p.createdAt DESC`;
+
+    const [rows] = await pool.query(sql, params);
+    return res.json({ practices: rows });
+  } catch (err) {
+    console.error("GET /api/practices failed:", err);
+    return res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+/**
+ * GET /api/practices/mine
+ * ✅ Return all my practices (ACTIVE + REMOVED) so user can still see their history
+ */
+router.get("/mine", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+
+    const [rows] = await pool.query(
+      `
+      SELECT 
+        practiceId,
+        title,
+        description,
+        status,
+        createdAt,
+        imageUrl,
+        season,
+        location,
+        effectivenessScore,
+        confidenceLevel
+      FROM practices
+      WHERE userId = ?
+      ORDER BY createdAt DESC
+      `,
+      [userId]
+    );
+
+    res.json({ practices: rows });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+/**
+ * GET /api/practices/applied
+ * ✅ Only show ACTIVE practices in bookmarks (so removed ones don't still appear)
+ */
+router.get("/applied", requireAuth, async (req, res) => {
+  const userId = req.user.userId;
+
+  try {
+    const [rows] = await pool.query(
+      `
+      SELECT 
+        ap.appliedId,
+        ap.status AS appliedStatus,
+        ap.appliedAt,
+        ap.reportedAt,
+
+        p.practiceId,
+        p.title,
+        p.description,
+        p.steps,
+        p.overview,
+        p.materials,
+        p.season,
+        p.location,
+        p.imageUrl,
+        p.effectivenessScore,
+        p.confidenceLevel,
+        p.createdAt,
+
+        u.fullName AS authorName
+      FROM applied_practices ap
+      JOIN practices p ON p.practiceId = ap.practiceId
+      JOIN users u ON u.userId = p.userId
+      WHERE ap.userId = ?
+        AND p.status = 'ACTIVE'
+      ORDER BY ap.appliedAt DESC
+      `,
+      [userId]
+    );
+
+    res.json({ applied: rows });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+router.get("/:id/stats", requireAuth, async (req, res) => {
+  const practiceId = parseInt(req.params.id, 10);
+  if (!Number.isInteger(practiceId) || practiceId <= 0) {
+    return res.status(400).json({ message: "Invalid practice id" });
+  }
+
+  try {
+    const [rows] = await pool.query(
+      `
+      SELECT
+        COUNT(*) AS totalReports,
+
+        SUM(CASE WHEN outcomeType = 'EFFECTIVE' THEN 1 ELSE 0 END) AS effective,
+        SUM(CASE WHEN outcomeType = 'PARTIAL' THEN 1 ELSE 0 END) AS partial,
+        SUM(CASE WHEN outcomeType = 'INEFFECTIVE' THEN 1 ELSE 0 END) AS ineffective,
+
+        SUM(CASE WHEN recommendation = 'YES' THEN 1 ELSE 0 END) AS yesCount,
+        SUM(CASE WHEN recommendation = 'NO' THEN 1 ELSE 0 END) AS noCount,
+        SUM(CASE WHEN recommendation = 'MAYBE' THEN 1 ELSE 0 END) AS maybeCount,
+
+        SUM(CASE WHEN recommendation IS NOT NULL THEN 1 ELSE 0 END) AS totalRecommendationAnswered
+      FROM outcomereports
+      WHERE practiceId = ? AND status = 'VALID'
+      `,
+      [practiceId]
+    );
+
+    const s = rows[0] || {};
+    const answered = Number(s.totalRecommendationAnswered || 0);
+    const yes = Number(s.yesCount || 0);
+
+    const recommendedRate = answered === 0 ? 0 : Math.round((yes / answered) * 100);
+
+    return res.json({
+      totalReports: Number(s.totalReports || 0),
+      effective: Number(s.effective || 0),
+      partial: Number(s.partial || 0),
+      ineffective: Number(s.ineffective || 0),
+
+      yesCount: Number(s.yesCount || 0),
+      noCount: Number(s.noCount || 0),
+      maybeCount: Number(s.maybeCount || 0),
+
+      recommendedRate,
+    });
+  } catch (err) {
+    return res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+/**
+ * GET /api/practices/:practiceId
+ * Public: returns a single practice detail.
+ * ✅ blocks non-ACTIVE already (kept)
+ */
+router.get("/:practiceId", async (req, res) => {
+  try {
+    const practiceId = Number(req.params.practiceId);
+    if (!Number.isInteger(practiceId) || practiceId <= 0) {
+      return res.status(400).json({ message: "Invalid practiceId" });
+    }
+
+    const [rows] = await pool.query(
+      `
+      SELECT
+        p.practiceId,
+        p.userId,
+        p.title,
+        p.description,
+        p.steps,
+        p.overview,
+        p.materials,
+        p.season,
+        p.location,
+        p.imageUrl,
+        p.status,
+        p.effectivenessScore,
+        p.confidenceLevel,
+        p.createdAt,
+
+        u.fullName AS authorName,
+        u.credibilityScore AS authorCredibility,
+        u.userRole AS authorRole,
+
+        ct.name AS cropType,
+        pt.name AS problemType,
+
+        COALESCE(os.totalReports, 0) AS totalReports,
+        COALESCE(os.validReports, 0) AS validReports,
+        COALESCE(cs.visibleComments, 0) AS visibleComments
+      FROM practices p
+      JOIN users u
+        ON u.userId = p.userId
+      LEFT JOIN croptypes ct
+        ON ct.cropTypeId = p.cropTypeId
+      LEFT JOIN problemtypes pt
+        ON pt.problemTypeId = p.problemTypeId
+      LEFT JOIN (
+        SELECT
+          practiceId,
+          COUNT(*) AS totalReports,
+          SUM(CASE WHEN status = 'VALID' THEN 1 ELSE 0 END) AS validReports
+        FROM outcomereports
+        GROUP BY practiceId
+      ) os
+        ON os.practiceId = p.practiceId
+      LEFT JOIN (
+        SELECT
+          practiceId,
+          COUNT(*) AS visibleComments
+        FROM comments
+        WHERE status = 'VISIBLE'
+        GROUP BY practiceId
+      ) cs
+        ON cs.practiceId = p.practiceId
+      WHERE p.practiceId = ?
+      LIMIT 1
+      `,
+      [practiceId]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ message: "Practice not found" });
+    }
+
+    const practice = rows[0];
+
+    if (practice.status !== "ACTIVE") {
+      return res.status(403).json({ message: "Practice is not available" });
+    }
+
+    return res.json({
+      practice: {
+        practiceId: practice.practiceId,
+        title: practice.title,
+        description: practice.description,
+        steps: practice.steps,
+        overview: practice.overview,
+        materials: practice.materials,
+        season: practice.season,
+        location: practice.location,
+        imageUrl: practice.imageUrl,
+        cropType: practice.cropType,
+        problemType: practice.problemType,
+        effectivenessScore: Number(practice.effectivenessScore),
+        confidenceLevel: practice.confidenceLevel,
+        createdAt: practice.createdAt,
+        author: {
+          userId: practice.userId,
+          fullName: practice.authorName,
+          credibilityScore: Number(practice.authorCredibility),
+          role: practice.authorRole,
+        },
+        stats: {
+          outcomes: {
+            totalReports: Number(practice.totalReports || 0),
+            validReports: Number(practice.validReports || 0),
+          },
+          comments: {
+            visibleComments: Number(practice.visibleComments || 0),
+          },
+        },
+      },
+    });
+  } catch (err) {
+    console.error("practice details error:", err);
+    return res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+router.post("/:id/apply", requireAuth, async (req, res) => {
+  const userId = req.user.userId;
+
+  const practiceId = parseInt(req.params.id, 10);
+  if (Number.isNaN(practiceId)) {
+    return res.status(400).json({ message: "Invalid practice id" });
+  }
+
+  try {
+    const [practice] = await pool.query(
+      "SELECT practiceId FROM practices WHERE practiceId = ? AND status = 'ACTIVE'",
+      [practiceId]
+    );
+
+    if (practice.length === 0) {
+      return res.status(404).json({ message: "Practice not found" });
+    }
+
+    await pool.query(
+      "INSERT INTO applied_practices (userId, practiceId) VALUES (?, ?)",
+      [userId, practiceId]
+    );
+
+    return res.json({ message: "Practice applied successfully", practiceId });
+  } catch (err) {
+    if (err.code === "ER_DUP_ENTRY") {
+      return res.status(409).json({ message: "You already applied this practice" });
+    }
+
+    return res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+/**
+ * DELETE /api/practices/:id
+ * (kept as hard delete by owner)
+ */
+router.delete("/:id", requireAuth, async (req, res) => {
+  try {
+    const practiceId = Number(req.params.id);
+    const userId = req.user.userId;
+
+    const [rows] = await pool.query("SELECT userId FROM practices WHERE practiceId = ?", [
+      practiceId,
+    ]);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ message: "Practice not found" });
+    }
+
+    if (rows[0].userId !== userId) {
+      return res.status(403).json({ message: "Not allowed" });
+    }
+
+    await pool.query("DELETE FROM practices WHERE practiceId = ?", [practiceId]);
+
+    res.json({ message: "Practice deleted successfully" });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+module.exports = router;
